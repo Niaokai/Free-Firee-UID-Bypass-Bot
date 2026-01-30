@@ -4,7 +4,7 @@ import requests
 import os
 import json
 from dotenv import load_dotenv
-from datetime import datetime, timedelta
+from datetime import datetime
 
 # ============================
 # ENVIRONMENT SETUP
@@ -17,8 +17,6 @@ JSONBIN_API_KEY = os.getenv("JSONBIN_API_KEY")
 BOT_TOKEN = os.getenv("DISCORD_BOT_TOKEN")
 LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 ALLOWED_CHANNEL = int(os.getenv("ALLOWED_CHANNEL", "0"))
-# [FIX] เพิ่ม DEV_DISCORD_ID สำหรับจำกัดสิทธิ์การกดปุ่ม Pause/Resume
-DEV_DISCORD_ID = int(os.getenv("DEV_DISCORD_ID", "0"))
 
 # Validate required environment variables
 required_vars = {
@@ -71,11 +69,6 @@ def get_whitelist_data():
 def update_whitelist_data(data):
     """Update whitelist data on JSONBin.io"""
     try:
-        # [CRITICAL] ตรวจสอบว่าข้อมูลต้องไม่เป็น None หรือโครงสร้างผิดเพี้ยนก่อนบันทึก
-        if data is None or not isinstance(data, list):
-            print("Aborting update: Invalid data structure detected.")
-            return False
-            
         response = requests.put(JSONBIN_URL, headers=JSONBIN_HEADERS, json=data, timeout=10)
         return response.status_code == 200
     except Exception as e:
@@ -278,12 +271,23 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
         required=True,
         max_length=50
     )
-    # [FIX] เปลี่ยนจาก ปี/เดือน/วัน เป็นการกรอก จำนวนวันแทน
-    days_input = ui.TextInput(
-        label="จำนวนวัน (Days)",
-        placeholder="ใส่จำนวนวันที่ต้องการให้ใช้งานได้ เช่น 3, 30, 365",
+    year_input = ui.TextInput(
+        label="ปี (Year)",
+        placeholder="เช่น 2025",
         required=True,
-        max_length=5
+        max_length=4
+    )
+    month_input = ui.TextInput(
+        label="เดือน (Month)",
+        placeholder="เช่น 12",
+        required=True,
+        max_length=2
+    )
+    day_input = ui.TextInput(
+        label="วัน (Day)",
+        placeholder="เช่น 31",
+        required=True,
+        max_length=2
     )
     comment_input = ui.TextInput(
         label="หมายเหตุ (Comment)",
@@ -306,12 +310,12 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
         
         try:
             uid = self.uid_input.value.strip()
-            days = int(self.days_input.value.strip())
+            year = int(self.year_input.value.strip())
+            month = int(self.month_input.value.strip())
+            day = int(self.day_input.value.strip())
             comment = self.comment_input.value.strip()
             
-            # [FIX] คำนวณวันหมดอายุอัตโนมัติจากวันที่ปัจจุบัน (UTC Local Time Based)
-            expiry_date_obj = datetime.now() + timedelta(days=days)
-            expiry = expiry_date_obj.strftime("%Y-%m-%d")
+            expiry = f"{year:04d}-{month:02d}-{day:02d}"
             
             existing_entry = get_uid_entry(uid)
             action = "updated" if existing_entry else "added"
@@ -322,13 +326,13 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
                 if action == "added":
                     embed = discord.Embed(
                         title="✅ เพิ่ม UID สำเร็จ",
-                        description=f"UID `{uid}` ถูกเพิ่มเรียบร้อยแล้ว (ได้รับ `{days}` วัน)",
+                        description=f"UID `{uid}` ถูกเพิ่มเรียบร้อยแล้ว",
                         color=COLOR_SUCCESS
                     )
                 else:
                     embed = discord.Embed(
                         title="🔄 อัพเดท UID สำเร็จ",
-                        description=f"UID `{uid}` ถูกอัพเดทเรียบร้อยแล้ว (ตั้งค่าใหม่เป็น `{days}` วัน)",
+                        description=f"UID `{uid}` ถูกอัพเดทเรียบร้อยแล้ว",
                         color=COLOR_WARNING
                     )
                 embed.add_field(name="📅 วันหมดอายุ", value=f"`{format_box_date(expiry)}`", inline=True)
@@ -340,7 +344,7 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
             else:
                 embed = discord.Embed(
                     title="❌ เกิดข้อผิดพลาด",
-                    description="ไม่สามารถบันทึกข้อมูลไปยัง JSONBin ได้",
+                    description="ไม่สามารถบันทึกข้อมูลได้",
                     color=COLOR_ERROR
                 )
                 await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -348,7 +352,7 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
         except ValueError:
             embed = discord.Embed(
                 title="❌ รูปแบบไม่ถูกต้อง",
-                description="กรุณากรอกจำนวนวันเป็นตัวเลขเท่านั้น",
+                description="กรุณากรอกปี เดือน วัน เป็นตัวเลข",
                 color=COLOR_ERROR
             )
             await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -535,18 +539,12 @@ class MainMenuView(ui.View):
     
     @ui.button(label="⏸️ หยุดระบบ", style=discord.ButtonStyle.secondary, custom_id="pause_system", row=2)
     async def pause_button(self, interaction: discord.Interaction, button: ui.Button):
-        # [FIX] จำกัดสิทธิ์ให้เฉพาะ DEV_DISCORD_ID เท่านั้น
-        if interaction.user.id != DEV_DISCORD_ID:
-            await interaction.response.send_message("❌ เฉพาะนักพัฒนาเท่านั้นที่สามารถสั่งหยุดระบบได้", ephemeral=True)
-            return
-
         global WHITELIST_PAUSED
-        WHITELIST_PAUSED = True
         
-        # [FIX] แก้ปัญหาข้อมูลหาย: ไม่เรียก update_whitelist_data() เพราะสถานะระบบเป็นตัวแปรในบอทเท่านั้น
+        WHITELIST_PAUSED = True
         embed = discord.Embed(
             title="⏸️ หยุดระบบชั่วคราว",
-            description="ระบบ Whitelist ถูกหยุดชั่วคราวแล้ว (ตัวแปรภายในเปลี่ยนแล้ว ข้อมูลใน JSONBin ยังคงเดิม)",
+            description="ระบบ Whitelist ถูกหยุดชั่วคราวแล้ว",
             color=COLOR_WARNING
         )
         embed.set_footer(text="🔴 Whitelist System")
@@ -555,18 +553,12 @@ class MainMenuView(ui.View):
     
     @ui.button(label="▶️ เปิดระบบ", style=discord.ButtonStyle.secondary, custom_id="resume_system", row=2)
     async def resume_button(self, interaction: discord.Interaction, button: ui.Button):
-        # [FIX] จำกัดสิทธิ์ให้เฉพาะ DEV_DISCORD_ID เท่านั้น
-        if interaction.user.id != DEV_DISCORD_ID:
-            await interaction.response.send_message("❌ เฉพาะนักพัฒนาเท่านั้นที่สามารถสั่งเปิดระบบได้", ephemeral=True)
-            return
-
         global WHITELIST_PAUSED
-        WHITELIST_PAUSED = False
         
-        # [FIX] แก้ปัญหาข้อมูลหาย: ไม่เรียก update_whitelist_data() เพราะสถานะระบบเป็นตัวแปรในบอทเท่านั้น
+        WHITELIST_PAUSED = False
         embed = discord.Embed(
             title="▶️ เปิดระบบ",
-            description="ระบบ Whitelist กลับมาทำงานแล้ว (ตัวแปรภายในเปลี่ยนแล้ว ข้อมูลใน JSONBin ยังคงเดิม)",
+            description="ระบบ Whitelist กลับมาทำงานแล้ว",
             color=COLOR_SUCCESS
         )
         embed.set_footer(text="🔴 Whitelist System")
@@ -613,17 +605,17 @@ async def menu_cmd(interaction: discord.Interaction):
         return
     
     embed = discord.Embed(
-        title="🔴 CHECKEN5STAR - System",
+        title="🔴 WHITELIST SYSTEM",
         description=(
             "**ยินดีต้อนรับสู่ระบบจัดการ Whitelist**\n\n"
             "กรุณาเลือกการดำเนินการจากปุ่มด้านล่าง:\n\n"
             "🔍 **ตรวจสอบ UID** - ค้นหาข้อมูล UID\n"
             "📋 **ดู UID ทั้งหมด** - แสดงรายการ UID ทั้งหมด\n"
-            "➕ **เพิ่ม UID** - เพิ่ม UID ใหม่เข้าระบบ (ระบุจำนวนวัน)\n"
+            "➕ **เพิ่ม UID** - เพิ่ม UID ใหม่เข้าระบบ\n"
             "🔄 **เปลี่ยน UID** - เปลี่ยน UID เก่าเป็น UID ใหม่\n"
             "🗑️ **ลบ UID** - ลบ UID ออกจากระบบ\n"
-            "⏸️ **หยุดระบบ** - หยุดระบบชั่วคราว (เฉพาะ DEV)\n"
-            "▶️ **เปิดระบบ** - เปิดระบบอีกครั้ง (เฉพาะ DEV)"
+            "⏸️ **หยุดระบบ** - หยุดระบบชั่วคราว\n"
+            "▶️ **เปิดระบบ** - เปิดระบบอีกครั้ง"
         ),
         color=COLOR_PRIMARY
     )
