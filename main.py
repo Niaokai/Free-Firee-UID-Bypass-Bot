@@ -241,6 +241,10 @@ class CheckUIDModal(ui.Modal, title="🔍 ตรวจสอบ UID"):
     
     async def on_submit(self, interaction: discord.Interaction):
         uid = self.uid_input.value.strip()
+        
+        # Defer response ก่อนเพื่อป้องกัน timeout (3 วินาที)
+        await interaction.response.defer(ephemeral=True)
+        
         entry = get_uid_entry(uid)
         
         if not entry:
@@ -249,7 +253,7 @@ class CheckUIDModal(ui.Modal, title="🔍 ตรวจสอบ UID"):
                 description=f"UID `{uid}` ไม่อยู่ในระบบ",
                 color=COLOR_ERROR
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
         
         pretty = format_box_date(entry["expiry_date"])
@@ -262,7 +266,7 @@ class CheckUIDModal(ui.Modal, title="🔍 ตรวจสอบ UID"):
         embed.add_field(name="📝 หมายเหตุ", value=f"`{entry['comment']}`", inline=True)
         embed.set_footer(text="🔴 Whitelist System")
         
-        await interaction.response.send_message(embed=embed, ephemeral=True)
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
@@ -311,6 +315,9 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
                 await interaction.response.send_message(embed=embed, ephemeral=True)
                 return
             
+            # Defer response ก่อนเพื่อป้องกัน timeout (3 วินาที)
+            await interaction.response.defer(ephemeral=True)
+            
             # คำนวณวันหมดอายุจากวันนี้ + จำนวนวัน
             expiry_date = datetime.now() + timedelta(days=days)
             expiry = expiry_date.strftime("%Y-%m-%d")
@@ -338,7 +345,7 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
                 embed.add_field(name="📝 หมายเหตุ", value=f"`{comment}`", inline=True)
                 embed.set_footer(text="🔴 Whitelist System")
                 
-                await interaction.response.send_message(embed=embed, ephemeral=True)
+                await interaction.followup.send(embed=embed, ephemeral=True)
                 await send_log(interaction.client, "ADD", uid, interaction.user, expiry, comment)
             else:
                 embed = discord.Embed(
@@ -346,7 +353,7 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
                     description="ไม่สามารถบันทึกข้อมูลได้",
                     color=COLOR_ERROR
                 )
-                await interaction.response.send_message(embed=embed, ephemeral=True)
+                await interaction.followup.send(embed=embed, ephemeral=True)
                 
         except ValueError:
             embed = discord.Embed(
@@ -378,6 +385,10 @@ class RemoveUIDModal(ui.Modal, title="🗑️ ลบ UID"):
             return
         
         uid = self.uid_input.value.strip()
+        
+        # Defer response ก่อนเพื่อป้องกัน timeout (3 วินาที)
+        await interaction.response.defer(ephemeral=True)
+        
         success = remove_uid_entry(uid)
         
         if success:
@@ -387,7 +398,7 @@ class RemoveUIDModal(ui.Modal, title="🗑️ ลบ UID"):
                 color=COLOR_SUCCESS
             )
             embed.set_footer(text="🔴 Whitelist System")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             await send_log(interaction.client, "REMOVE", uid, interaction.user)
         else:
             embed = discord.Embed(
@@ -395,7 +406,7 @@ class RemoveUIDModal(ui.Modal, title="🗑️ ลบ UID"):
                 description=f"UID `{uid}` ไม่อยู่ในระบบ",
                 color=COLOR_ERROR
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class ChangeUIDModal(ui.Modal, title="🔄 เปลี่ยน UID"):
@@ -436,6 +447,9 @@ class ChangeUIDModal(ui.Modal, title="🔄 เปลี่ยน UID"):
             await interaction.response.send_message(embed=embed, ephemeral=True)
             return
         
+        # Defer response ก่อนเพื่อป้องกัน timeout (3 วินาที)
+        await interaction.response.defer(ephemeral=True)
+        
         success, status = change_uid_entry(old_uid, new_uid)
         
         if success:
@@ -445,7 +459,7 @@ class ChangeUIDModal(ui.Modal, title="🔄 เปลี่ยน UID"):
                 color=COLOR_SUCCESS
             )
             embed.set_footer(text="🔴 Whitelist System")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             await send_log(interaction.client, "CHANGE", new_uid, interaction.user, old_uid=old_uid)
         else:
             if status == "OLD_UID_NOT_FOUND":
@@ -466,7 +480,7 @@ class ChangeUIDModal(ui.Modal, title="🔄 เปลี่ยน UID"):
                     description="ไม่สามารถเปลี่ยน UID ได้",
                     color=COLOR_ERROR
                 )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ============================
@@ -483,6 +497,9 @@ class MainMenuView(ui.View):
     
     @ui.button(label="📋 ดู UID ทั้งหมด", style=discord.ButtonStyle.danger, custom_id="list_uids", row=0)
     async def list_uids_button(self, interaction: discord.Interaction, button: ui.Button):
+        # Defer response ก่อนเพื่อป้องกัน timeout (3 วินาที)
+        await interaction.response.defer(ephemeral=True)
+        
         try:
             data = get_all_uids()
             
@@ -492,7 +509,7 @@ class MainMenuView(ui.View):
                     description="ไม่มี UID ในระบบ",
                     color=COLOR_INFO
                 )
-                await interaction.response.send_message(embed=embed, ephemeral=True)
+                await interaction.followup.send(embed=embed, ephemeral=True)
                 return
             
             embed = discord.Embed(
@@ -514,7 +531,7 @@ class MainMenuView(ui.View):
                 embed.add_field(name="📦 UIDs", value=uid_list, inline=False)
             
             embed.set_footer(text=f"🔴 ทั้งหมด {len(data)} รายการ")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             
         except Exception as e:
             embed = discord.Embed(
@@ -522,7 +539,7 @@ class MainMenuView(ui.View):
                 description="ไม่สามารถเชื่อมต่อฐานข้อมูลได้",
                 color=COLOR_ERROR
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
     
     @ui.button(label="➕ เพิ่ม UID", style=discord.ButtonStyle.danger, custom_id="add_uid", row=1)
     async def add_uid_button(self, interaction: discord.Interaction, button: ui.Button):
