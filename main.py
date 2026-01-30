@@ -2,7 +2,8 @@ import discord
 from discord import app_commands, ui
 import requests
 import os
-import json
+import asyncio
+import threading
 from dotenv import load_dotenv
 from datetime import datetime, timedelta
 
@@ -48,97 +49,127 @@ COLOR_WARNING = 0xFF6347     # Tomato (Warning)
 COLOR_INFO = 0xCD5C5C        # Indian Red (Info)
 
 # ============================
-# JSONBIN.IO FUNCTIONS
+# LOCAL CACHE SYSTEM
 # ============================
-def get_whitelist_data():
-    """Fetch whitelist data from JSONBin.io"""
+WHITELIST_CACHE = []
+CACHE_LOCK = threading.Lock()
+CACHE_LOADED = False
+
+def load_cache_from_jsonbin():
+    """Load data from JSONBin to local cache (called once at startup)"""
+    global WHITELIST_CACHE, CACHE_LOADED
     try:
-        response = requests.get(JSONBIN_URL, headers=JSONBIN_HEADERS, timeout=10)
+        response = requests.get(JSONBIN_URL, headers=JSONBIN_HEADERS, timeout=30)
         if response.status_code == 200:
             data = response.json()
-            if isinstance(data, list):
-                return data
-            else:
-                return []
+            with CACHE_LOCK:
+                WHITELIST_CACHE = data if isinstance(data, list) else []
+                CACHE_LOADED = True
+            print(f"[CACHE] Loaded {len(WHITELIST_CACHE)} entries from JSONBin")
+            return True
         else:
-            print(f"Error fetching data: {response.status_code}")
-            return []
+            print(f"[CACHE] Error loading: {response.status_code}")
+            return False
     except Exception as e:
-        print(f"Error fetching from JSONBin: {e}")
-        return []
-
-def update_whitelist_data(data):
-    """Update whitelist data on JSONBin.io"""
-    try:
-        response = requests.put(JSONBIN_URL, headers=JSONBIN_HEADERS, json=data, timeout=10)
-        return response.status_code == 200
-    except Exception as e:
-        print(f"Error updating JSONBin: {e}")
+        print(f"[CACHE] Error loading from JSONBin: {e}")
         return False
 
+def sync_cache_to_jsonbin():
+    """Sync local cache to JSONBin (background task)"""
+    try:
+        with CACHE_LOCK:
+            data_to_sync = WHITELIST_CACHE.copy()
+        
+        response = requests.put(JSONBIN_URL, headers=JSONBIN_HEADERS, json=data_to_sync, timeout=30)
+        if response.status_code == 200:
+            print(f"[SYNC] Successfully synced {len(data_to_sync)} entries to JSONBin")
+            return True
+        else:
+            print(f"[SYNC] Error syncing: {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"[SYNC] Error syncing to JSONBin: {e}")
+        return False
+
+def sync_in_background():
+    """Run sync in a separate thread to not block the bot"""
+    thread = threading.Thread(target=sync_cache_to_jsonbin)
+    thread.start()
+
+# ============================
+# FAST CACHE FUNCTIONS (NO API CALLS)
+# ============================
 def get_uid_entry(uid):
-    """Get specific UID entry from whitelist"""
-    data = get_whitelist_data()
-    for entry in data:
-        if entry.get("uid") == uid:
-            return entry
+    """Get specific UID entry from local cache (instant)"""
+    with CACHE_LOCK:
+        for entry in WHITELIST_CACHE:
+            if entry.get("uid") == uid:
+                return entry.copy()
     return None
 
 def add_uid_entry(uid, expiry, comment):
-    """Add or update UID entry"""
-    data = get_whitelist_data()
+    """Add or update UID entry in local cache, then sync in background"""
+    global WHITELIST_CACHE
     
-    existing_index = -1
-    for i, entry in enumerate(data):
-        if entry.get("uid") == uid:
-            existing_index = i
-            break
+    with CACHE_LOCK:
+        existing_index = -1
+        for i, entry in enumerate(WHITELIST_CACHE):
+            if entry.get("uid") == uid:
+                existing_index = i
+                break
+        
+        new_entry = {
+            "uid": uid,
+            "expiry_date": expiry,
+            "comment": comment
+        }
+        
+        if existing_index >= 0:
+            WHITELIST_CACHE[existing_index] = new_entry
+        else:
+            WHITELIST_CACHE.append(new_entry)
     
-    new_entry = {
-        "uid": uid,
-        "expiry_date": expiry,
-        "comment": comment
-    }
-    
-    if existing_index >= 0:
-        data[existing_index] = new_entry
-    else:
-        data.append(new_entry)
-    
-    return update_whitelist_data(data)
+    # Sync to JSONBin in background
+    sync_in_background()
+    return True
 
 def remove_uid_entry(uid):
-    """Remove UID entry"""
-    data = get_whitelist_data()
-    new_data = [entry for entry in data if entry.get("uid") != uid]
+    """Remove UID entry from local cache, then sync in background"""
+    global WHITELIST_CACHE
     
-    if len(new_data) != len(data):
-        return update_whitelist_data(new_data)
+    with CACHE_LOCK:
+        original_len = len(WHITELIST_CACHE)
+        WHITELIST_CACHE = [entry for entry in WHITELIST_CACHE if entry.get("uid") != uid]
+        removed = len(WHITELIST_CACHE) != original_len
+    
+    if removed:
+        sync_in_background()
+        return True
     return False
 
 def change_uid_entry(old_uid, new_uid):
-    """Change UID from old to new while keeping expiry and comment"""
-    data = get_whitelist_data()
+    """Change UID from old to new in local cache, then sync in background"""
+    global WHITELIST_CACHE
     
-    # Check if new UID already exists
-    for entry in data:
-        if entry.get("uid") == new_uid:
-            return False, "NEW_UID_EXISTS"
-    
-    # Find and update old UID
-    for entry in data:
-        if entry.get("uid") == old_uid:
-            entry["uid"] = new_uid
-            if update_whitelist_data(data):
+    with CACHE_LOCK:
+        # Check if new UID already exists
+        for entry in WHITELIST_CACHE:
+            if entry.get("uid") == new_uid:
+                return False, "NEW_UID_EXISTS"
+        
+        # Find and update old UID
+        for entry in WHITELIST_CACHE:
+            if entry.get("uid") == old_uid:
+                entry["uid"] = new_uid
+                sync_in_background()
                 return True, "SUCCESS"
-            else:
-                return False, "UPDATE_FAILED"
     
     return False, "OLD_UID_NOT_FOUND"
 
 def get_all_uids():
-    """Get all UID entries"""
-    return get_whitelist_data()
+    """Get all UID entries from local cache (instant)"""
+    with CACHE_LOCK:
+        return WHITELIST_CACHE.copy()
 
 # ============================
 # LOGGING SYSTEM
@@ -242,9 +273,7 @@ class CheckUIDModal(ui.Modal, title="🔍 ตรวจสอบ UID"):
     async def on_submit(self, interaction: discord.Interaction):
         uid = self.uid_input.value.strip()
         
-        # Defer response ก่อนเพื่อป้องกัน timeout (3 วินาที)
-        await interaction.response.defer(ephemeral=True)
-        
+        # ใช้ cache ทำให้เร็วมาก ไม่ต้อง defer
         entry = get_uid_entry(uid)
         
         if not entry:
@@ -253,7 +282,7 @@ class CheckUIDModal(ui.Modal, title="🔍 ตรวจสอบ UID"):
                 description=f"UID `{uid}` ไม่อยู่ในระบบ",
                 color=COLOR_ERROR
             )
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
         
         pretty = format_box_date(entry["expiry_date"])
@@ -266,7 +295,7 @@ class CheckUIDModal(ui.Modal, title="🔍 ตรวจสอบ UID"):
         embed.add_field(name="📝 หมายเหตุ", value=f"`{entry['comment']}`", inline=True)
         embed.set_footer(text="🔴 Whitelist System")
         
-        await interaction.followup.send(embed=embed, ephemeral=True)
+        await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
@@ -292,16 +321,13 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
     async def on_submit(self, interaction: discord.Interaction):
         global WHITELIST_PAUSED
         
-        # Defer response ทันทีเพื่อป้องกัน timeout (3 วินาที)
-        await interaction.response.defer(ephemeral=True)
-        
         if WHITELIST_PAUSED:
             embed = discord.Embed(
                 title="⚠️ ระบบถูกหยุดชั่วคราว",
                 description="ไม่สามารถเพิ่ม UID ได้ในขณะนี้",
                 color=COLOR_WARNING
             )
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
         
         try:
@@ -315,7 +341,7 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
                     description="กรุณากรอกจำนวนวันมากกว่า 0",
                     color=COLOR_ERROR
                 )
-                await interaction.followup.send(embed=embed, ephemeral=True)
+                await interaction.response.send_message(embed=embed, ephemeral=True)
                 return
             
             # คำนวณวันหมดอายุจากวันนี้ + จำนวนวัน
@@ -325,6 +351,7 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
             existing_entry = get_uid_entry(uid)
             action = "updated" if existing_entry else "added"
             
+            # ใช้ cache ทำให้เร็วมาก (sync ไป JSONBin ใน background)
             success = add_uid_entry(uid, expiry, comment)
             
             if success:
@@ -345,7 +372,7 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
                 embed.add_field(name="📝 หมายเหตุ", value=f"`{comment}`", inline=True)
                 embed.set_footer(text="🔴 Whitelist System")
                 
-                await interaction.followup.send(embed=embed, ephemeral=True)
+                await interaction.response.send_message(embed=embed, ephemeral=True)
                 await send_log(interaction.client, "ADD", uid, interaction.user, expiry, comment)
             else:
                 embed = discord.Embed(
@@ -353,7 +380,7 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
                     description="ไม่สามารถบันทึกข้อมูลได้",
                     color=COLOR_ERROR
                 )
-                await interaction.followup.send(embed=embed, ephemeral=True)
+                await interaction.response.send_message(embed=embed, ephemeral=True)
                 
         except ValueError:
             embed = discord.Embed(
@@ -361,7 +388,7 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
                 description="กรุณากรอกจำนวนวันเป็นตัวเลข",
                 color=COLOR_ERROR
             )
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class RemoveUIDModal(ui.Modal, title="🗑️ ลบ UID"):
@@ -375,19 +402,18 @@ class RemoveUIDModal(ui.Modal, title="🗑️ ลบ UID"):
     async def on_submit(self, interaction: discord.Interaction):
         global WHITELIST_PAUSED
         
-        # Defer response ทันทีเพื่อป้องกัน timeout (3 วินาที)
-        await interaction.response.defer(ephemeral=True)
-        
         if WHITELIST_PAUSED:
             embed = discord.Embed(
                 title="⚠️ ระบบถูกหยุดชั่วคราว",
                 description="ไม่สามารถลบ UID ได้ในขณะนี้",
                 color=COLOR_WARNING
             )
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
         
         uid = self.uid_input.value.strip()
+        
+        # ใช้ cache ทำให้เร็วมาก (sync ไป JSONBin ใน background)
         success = remove_uid_entry(uid)
         
         if success:
@@ -397,7 +423,7 @@ class RemoveUIDModal(ui.Modal, title="🗑️ ลบ UID"):
                 color=COLOR_SUCCESS
             )
             embed.set_footer(text="🔴 Whitelist System")
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             await send_log(interaction.client, "REMOVE", uid, interaction.user)
         else:
             embed = discord.Embed(
@@ -405,7 +431,7 @@ class RemoveUIDModal(ui.Modal, title="🗑️ ลบ UID"):
                 description=f"UID `{uid}` ไม่อยู่ในระบบ",
                 color=COLOR_ERROR
             )
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 class ChangeUIDModal(ui.Modal, title="🔄 เปลี่ยน UID"):
@@ -425,16 +451,13 @@ class ChangeUIDModal(ui.Modal, title="🔄 เปลี่ยน UID"):
     async def on_submit(self, interaction: discord.Interaction):
         global WHITELIST_PAUSED
         
-        # Defer response ทันทีเพื่อป้องกัน timeout (3 วินาที)
-        await interaction.response.defer(ephemeral=True)
-        
         if WHITELIST_PAUSED:
             embed = discord.Embed(
                 title="⚠️ ระบบถูกหยุดชั่วคราว",
                 description="ไม่สามารถเปลี่ยน UID ได้ในขณะนี้",
                 color=COLOR_WARNING
             )
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
         
         old_uid = self.old_uid_input.value.strip()
@@ -446,9 +469,10 @@ class ChangeUIDModal(ui.Modal, title="🔄 เปลี่ยน UID"):
                 description="UID เก่าและใหม่ต้องไม่เหมือนกัน",
                 color=COLOR_ERROR
             )
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             return
         
+        # ใช้ cache ทำให้เร็วมาก (sync ไป JSONBin ใน background)
         success, status = change_uid_entry(old_uid, new_uid)
         
         if success:
@@ -458,7 +482,7 @@ class ChangeUIDModal(ui.Modal, title="🔄 เปลี่ยน UID"):
                 color=COLOR_SUCCESS
             )
             embed.set_footer(text="🔴 Whitelist System")
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             await send_log(interaction.client, "CHANGE", new_uid, interaction.user, old_uid=old_uid)
         else:
             if status == "OLD_UID_NOT_FOUND":
@@ -479,7 +503,7 @@ class ChangeUIDModal(ui.Modal, title="🔄 เปลี่ยน UID"):
                     description="ไม่สามารถเปลี่ยน UID ได้",
                     color=COLOR_ERROR
                 )
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
 
 
 # ============================
@@ -496,9 +520,7 @@ class MainMenuView(ui.View):
     
     @ui.button(label="📋 ดู UID ทั้งหมด", style=discord.ButtonStyle.danger, custom_id="list_uids", row=0)
     async def list_uids_button(self, interaction: discord.Interaction, button: ui.Button):
-        # Defer response ก่อนเพื่อป้องกัน timeout (3 วินาที)
-        await interaction.response.defer(ephemeral=True)
-        
+        # ใช้ cache ทำให้เร็วมาก ไม่ต้อง defer
         try:
             data = get_all_uids()
             
@@ -508,7 +530,7 @@ class MainMenuView(ui.View):
                     description="ไม่มี UID ในระบบ",
                     color=COLOR_INFO
                 )
-                await interaction.followup.send(embed=embed, ephemeral=True)
+                await interaction.response.send_message(embed=embed, ephemeral=True)
                 return
             
             embed = discord.Embed(
@@ -530,7 +552,7 @@ class MainMenuView(ui.View):
                 embed.add_field(name="📦 UIDs", value=uid_list, inline=False)
             
             embed.set_footer(text=f"🔴 ทั้งหมด {len(data)} รายการ")
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
             
         except Exception as e:
             embed = discord.Embed(
@@ -538,7 +560,7 @@ class MainMenuView(ui.View):
                 description="ไม่สามารถเชื่อมต่อฐานข้อมูลได้",
                 color=COLOR_ERROR
             )
-            await interaction.followup.send(embed=embed, ephemeral=True)
+            await interaction.response.send_message(embed=embed, ephemeral=True)
     
     @ui.button(label="➕ เพิ่ม UID", style=discord.ButtonStyle.danger, custom_id="add_uid", row=1)
     async def add_uid_button(self, interaction: discord.Interaction, button: ui.Button):
@@ -597,6 +619,38 @@ class MainMenuView(ui.View):
         embed.set_footer(text="🔴 Whitelist System")
         await interaction.response.send_message(embed=embed, ephemeral=True)
         await send_log(interaction.client, "RESUME", "", interaction.user)
+    
+    @ui.button(label="🔄 Sync ข้อมูล", style=discord.ButtonStyle.secondary, custom_id="force_sync", row=3)
+    async def force_sync_button(self, interaction: discord.Interaction, button: ui.Button):
+        """Force sync data from JSONBin to refresh cache"""
+        if interaction.user.id != DEV_ID:
+            embed = discord.Embed(
+                title="❌ ไม่มีสิทธิ์",
+                description="เฉพาะเจ้าของบอทเท่านั้นที่สามารถ Sync ข้อมูลได้",
+                color=COLOR_ERROR
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        
+        # Defer because this calls JSONBin
+        await interaction.response.defer(ephemeral=True)
+        
+        success = load_cache_from_jsonbin()
+        
+        if success:
+            embed = discord.Embed(
+                title="✅ Sync สำเร็จ",
+                description=f"โหลดข้อมูล {len(WHITELIST_CACHE)} รายการจาก JSONBin",
+                color=COLOR_SUCCESS
+            )
+        else:
+            embed = discord.Embed(
+                title="❌ Sync ล้มเหลว",
+                description="ไม่สามารถเชื่อมต่อ JSONBin ได้",
+                color=COLOR_ERROR
+            )
+        embed.set_footer(text="🔴 Whitelist System")
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 # ============================
@@ -610,13 +664,17 @@ class MyBot(discord.Client):
     async def on_ready(self):
         print(f"[READY] Logged in as {self.user}")
         
+        # Load cache from JSONBin at startup
+        print("[STARTUP] Loading cache from JSONBin...")
+        load_cache_from_jsonbin()
+        
         # Register persistent view
         self.add_view(MainMenuView())
         
         try:
             cmds = await self.tree.sync()
             print(f"Synced {len(cmds)} commands.")
-            await send_simple_log(self, "🔴 **Bot Started Successfully**")
+            await send_simple_log(self, "🟢 **Bot Started Successfully**")
         except Exception as e:
             print(f"Error syncing commands: {e}")
 
@@ -626,13 +684,13 @@ class MyBot(discord.Client):
 bot = MyBot()
 
 # ============================
-# /menu - SHOW MAIN MENU WITH BUTTONS
+# /menu COMMAND
 # ============================
 @bot.tree.command(name="menu", description="แสดงเมนูหลัก Whitelist System")
 async def menu_cmd(interaction: discord.Interaction):
     if ALLOWED_CHANNEL and interaction.channel_id != ALLOWED_CHANNEL:
         await interaction.response.send_message(
-            "❌ คุณสามารถใช้คำสั่งได้เฉพาะในช่องที่กำหนดเท่านั้น",
+            "❌ ไม่สามารถใช้คำสั่งในช่องนี้ได้",
             ephemeral=True
         )
         return
@@ -640,25 +698,20 @@ async def menu_cmd(interaction: discord.Interaction):
     embed = discord.Embed(
         title="🔴 WHITELIST SYSTEM",
         description=(
-            "**ยินดีต้อนรับสู่ระบบจัดการ Whitelist**\n\n"
-            "กรุณาเลือกการดำเนินการจากปุ่มด้านล่าง:\n\n"
+            "ยินดีต้อนรับสู่ระบบ Whitelist\n"
+            "กรุณาเลือกฟังก์ชันที่ต้องการจากปุ่มด้านล่าง\n\n"
             "🔍 **ตรวจสอบ UID** - ค้นหาข้อมูล UID\n"
             "📋 **ดู UID ทั้งหมด** - แสดงรายการ UID ทั้งหมด\n"
             "➕ **เพิ่ม UID** - เพิ่ม UID ใหม่เข้าระบบ\n"
             "🔄 **เปลี่ยน UID** - เปลี่ยน UID เก่าเป็น UID ใหม่\n"
             "🗑️ **ลบ UID** - ลบ UID ออกจากระบบ\n"
             "⏸️ **หยุดระบบ** - หยุดระบบชั่วคราว (Owner)\n"
-            "▶️ **เปิดระบบ** - เปิดระบบอีกครั้ง (Owner)"
+            "▶️ **เปิดระบบ** - เปิดระบบอีกครั้ง (Owner)\n"
+            "🔄 **Sync ข้อมูล** - โหลดข้อมูลใหม่จาก JSONBin (Owner)"
         ),
         color=COLOR_PRIMARY
     )
-    embed.set_footer(text="🔴 Whitelist System | เลือกปุ่มด้านล่างเพื่อดำเนินการ")
-    
-    # Check system status
-    if WHITELIST_PAUSED:
-        embed.add_field(name="⚠️ สถานะระบบ", value="**หยุดชั่วคราว**", inline=False)
-    else:
-        embed.add_field(name="✅ สถานะระบบ", value="**ทำงานปกติ**", inline=False)
+    embed.set_footer(text="🔴 Whitelist System | Button-Based Interface")
     
     await interaction.response.send_message(embed=embed, view=MainMenuView())
 
