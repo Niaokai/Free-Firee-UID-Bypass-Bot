@@ -292,13 +292,16 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
     async def on_submit(self, interaction: discord.Interaction):
         global WHITELIST_PAUSED
         
+        # Defer response ทันทีเพื่อป้องกัน timeout (3 วินาที)
+        await interaction.response.defer(ephemeral=True)
+        
         if WHITELIST_PAUSED:
             embed = discord.Embed(
                 title="⚠️ ระบบถูกหยุดชั่วคราว",
                 description="ไม่สามารถเพิ่ม UID ได้ในขณะนี้",
                 color=COLOR_WARNING
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
         
         try:
@@ -312,11 +315,8 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
                     description="กรุณากรอกจำนวนวันมากกว่า 0",
                     color=COLOR_ERROR
                 )
-                await interaction.response.send_message(embed=embed, ephemeral=True)
+                await interaction.followup.send(embed=embed, ephemeral=True)
                 return
-            
-            # Defer response ก่อนเพื่อป้องกัน timeout (3 วินาที)
-            await interaction.response.defer(ephemeral=True)
             
             # คำนวณวันหมดอายุจากวันนี้ + จำนวนวัน
             expiry_date = datetime.now() + timedelta(days=days)
@@ -361,7 +361,7 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
                 description="กรุณากรอกจำนวนวันเป็นตัวเลข",
                 color=COLOR_ERROR
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
 
 
 class RemoveUIDModal(ui.Modal, title="🗑️ ลบ UID"):
@@ -375,20 +375,19 @@ class RemoveUIDModal(ui.Modal, title="🗑️ ลบ UID"):
     async def on_submit(self, interaction: discord.Interaction):
         global WHITELIST_PAUSED
         
+        # Defer response ทันทีเพื่อป้องกัน timeout (3 วินาที)
+        await interaction.response.defer(ephemeral=True)
+        
         if WHITELIST_PAUSED:
             embed = discord.Embed(
                 title="⚠️ ระบบถูกหยุดชั่วคราว",
                 description="ไม่สามารถลบ UID ได้ในขณะนี้",
                 color=COLOR_WARNING
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
         
         uid = self.uid_input.value.strip()
-        
-        # Defer response ก่อนเพื่อป้องกัน timeout (3 วินาที)
-        await interaction.response.defer(ephemeral=True)
-        
         success = remove_uid_entry(uid)
         
         if success:
@@ -426,13 +425,16 @@ class ChangeUIDModal(ui.Modal, title="🔄 เปลี่ยน UID"):
     async def on_submit(self, interaction: discord.Interaction):
         global WHITELIST_PAUSED
         
+        # Defer response ทันทีเพื่อป้องกัน timeout (3 วินาที)
+        await interaction.response.defer(ephemeral=True)
+        
         if WHITELIST_PAUSED:
             embed = discord.Embed(
                 title="⚠️ ระบบถูกหยุดชั่วคราว",
                 description="ไม่สามารถเปลี่ยน UID ได้ในขณะนี้",
                 color=COLOR_WARNING
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
         
         old_uid = self.old_uid_input.value.strip()
@@ -444,11 +446,8 @@ class ChangeUIDModal(ui.Modal, title="🔄 เปลี่ยน UID"):
                 description="UID เก่าและใหม่ต้องไม่เหมือนกัน",
                 color=COLOR_ERROR
             )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
-        
-        # Defer response ก่อนเพื่อป้องกัน timeout (3 วินาที)
-        await interaction.response.defer(ephemeral=True)
         
         success, status = change_uid_entry(old_uid, new_uid)
         
