@@ -3,8 +3,10 @@ from discord import app_commands, ui
 import requests
 import os
 import json
+import asyncio
 from dotenv import load_dotenv
 from datetime import datetime
+from functools import partial
 
 # ============================
 # ENVIRONMENT SETUP
@@ -35,8 +37,6 @@ JSONBIN_HEADERS = {
     "X-Bin-Meta": "false"
 }
 
-WHITELIST_PAUSED = False
-
 # ============================
 # RED THEME COLORS
 # ============================
@@ -47,27 +47,22 @@ COLOR_WARNING = 0xFF6347     # Tomato (Warning)
 COLOR_INFO = 0xCD5C5C        # Indian Red (Info)
 
 # ============================
-# JSONBIN.IO FUNCTIONS
+# JSONBIN.IO FUNCTIONS (THREAD-SAFE WRAPPERS)
 # ============================
-def get_whitelist_data():
-    """Fetch whitelist data from JSONBin.io"""
+def fetch_jsonbin():
+    """Blocking function to fetch data"""
     try:
         response = requests.get(JSONBIN_URL, headers=JSONBIN_HEADERS, timeout=10)
         if response.status_code == 200:
             data = response.json()
-            if isinstance(data, list):
-                return data
-            else:
-                return []
-        else:
-            print(f"Error fetching data: {response.status_code}")
-            return []
+            return data if isinstance(data, list) else []
+        return []
     except Exception as e:
         print(f"Error fetching from JSONBin: {e}")
         return []
 
-def update_whitelist_data(data):
-    """Update whitelist data on JSONBin.io"""
+def push_jsonbin(data):
+    """Blocking function to update data"""
     try:
         response = requests.put(JSONBIN_URL, headers=JSONBIN_HEADERS, json=data, timeout=10)
         return response.status_code == 200
@@ -75,146 +70,108 @@ def update_whitelist_data(data):
         print(f"Error updating JSONBin: {e}")
         return False
 
-def get_uid_entry(uid):
-    """Get specific UID entry from whitelist"""
-    data = get_whitelist_data()
+async def get_whitelist_data():
+    """Non-blocking fetch using run_in_executor to prevent event loop lag"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, fetch_jsonbin)
+
+async def update_whitelist_data(data):
+    """Non-blocking update"""
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, partial(push_jsonbin, data))
+
+async def get_uid_entry(uid):
+    data = await get_whitelist_data()
     for entry in data:
         if entry.get("uid") == uid:
             return entry
     return None
 
-def add_uid_entry(uid, expiry, comment):
-    """Add or update UID entry"""
-    data = get_whitelist_data()
-    
+async def add_uid_entry(uid, expiry, comment):
+    data = await get_whitelist_data()
     existing_index = -1
     for i, entry in enumerate(data):
         if entry.get("uid") == uid:
             existing_index = i
             break
     
-    new_entry = {
-        "uid": uid,
-        "expiry_date": expiry,
-        "comment": comment
-    }
-    
+    new_entry = {"uid": uid, "expiry_date": expiry, "comment": comment}
     if existing_index >= 0:
         data[existing_index] = new_entry
     else:
         data.append(new_entry)
     
-    return update_whitelist_data(data)
+    return await update_whitelist_data(data)
 
-def remove_uid_entry(uid):
-    """Remove UID entry"""
-    data = get_whitelist_data()
+async def remove_uid_entry(uid):
+    data = await get_whitelist_data()
     new_data = [entry for entry in data if entry.get("uid") != uid]
-    
     if len(new_data) != len(data):
-        return update_whitelist_data(new_data)
+        return await update_whitelist_data(new_data)
     return False
 
-def change_uid_entry(old_uid, new_uid):
-    """Change UID from old to new while keeping expiry and comment"""
-    data = get_whitelist_data()
-    
-    # Check if new UID already exists
+async def change_uid_entry(old_uid, new_uid):
+    data = await get_whitelist_data()
     for entry in data:
         if entry.get("uid") == new_uid:
             return False, "NEW_UID_EXISTS"
     
-    # Find and update old UID
+    found = False
     for entry in data:
         if entry.get("uid") == old_uid:
             entry["uid"] = new_uid
-            if update_whitelist_data(data):
-                return True, "SUCCESS"
-            else:
-                return False, "UPDATE_FAILED"
+            found = True
+            break
+            
+    if found:
+        success = await update_whitelist_data(data)
+        return (True, "SUCCESS") if success else (False, "UPDATE_FAILED")
     
     return False, "OLD_UID_NOT_FOUND"
-
-def get_all_uids():
-    """Get all UID entries"""
-    return get_whitelist_data()
 
 # ============================
 # LOGGING SYSTEM
 # ============================
 async def send_log(bot, action: str, uid: str, user: discord.User, expiry: str = None, comment: str = None, old_uid: str = None):
-    """Enhanced logging function with formatted messages"""
-    if not LOG_CHANNEL_ID:
-        return
-        
+    if not LOG_CHANNEL_ID: return
     ch = bot.get_channel(LOG_CHANNEL_ID)
-    if not ch:
-        return
+    if not ch: return
 
     current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    embed = discord.Embed(timestamp=datetime.now())
+    embed.set_footer(text="🔴 Whitelist System")
     
     if action == "ADD":
-        embed = discord.Embed(
-            title="🔴 UID ADDED",
-            color=COLOR_SUCCESS,
-            timestamp=datetime.now()
-        )
+        embed.title = "🔴 UID ADDED"
+        embed.color = COLOR_SUCCESS
         embed.add_field(name="UID", value=f"`{uid}`", inline=True)
         embed.add_field(name="Expiry", value=f"`{expiry}`", inline=True)
         embed.add_field(name="Comment", value=f"`{comment}`", inline=True)
-        embed.add_field(name="Added By", value=f"`{user.name}`\n(`{user.id}`)", inline=True)
-        embed.add_field(name="Timestamp", value=f"`{current_time}`", inline=True)
-        
     elif action == "REMOVE":
-        embed = discord.Embed(
-            title="❌ UID REMOVED",
-            color=COLOR_ERROR,
-            timestamp=datetime.now()
-        )
+        embed.title = "❌ UID REMOVED"
+        embed.color = COLOR_ERROR
         embed.add_field(name="UID", value=f"`{uid}`", inline=True)
-        embed.add_field(name="Removed By", value=f"`{user.name}`\n(`{user.id}`)", inline=True)
-        embed.add_field(name="Timestamp", value=f"`{current_time}`", inline=True)
-        
     elif action == "CHANGE":
-        embed = discord.Embed(
-            title="🔄 UID CHANGED",
-            color=COLOR_WARNING,
-            timestamp=datetime.now()
-        )
+        embed.title = "🔄 UID CHANGED"
+        embed.color = COLOR_WARNING
         embed.add_field(name="Old UID", value=f"`{old_uid}`", inline=True)
         embed.add_field(name="New UID", value=f"`{uid}`", inline=True)
-        embed.add_field(name="Changed By", value=f"`{user.name}`\n(`{user.id}`)", inline=True)
-        embed.add_field(name="Timestamp", value=f"`{current_time}`", inline=True)
-        
-    elif action == "PAUSE":
-        embed = discord.Embed(
-            title="⏸️ SYSTEM PAUSED",
-            color=COLOR_WARNING,
-            timestamp=datetime.now()
-        )
-        embed.add_field(name="Action By", value=f"`{user.name}`\n(`{user.id}`)", inline=True)
-        embed.add_field(name="Timestamp", value=f"`{current_time}`", inline=True)
-        
-    elif action == "RESUME":
-        embed = discord.Embed(
-            title="▶️ SYSTEM RESUMED",
-            color=COLOR_SUCCESS,
-            timestamp=datetime.now()
-        )
-        embed.add_field(name="Action By", value=f"`{user.name}`\n(`{user.id}`)", inline=True)
-        embed.add_field(name="Timestamp", value=f"`{current_time}`", inline=True)
+
+    embed.add_field(name="Action By", value=f"`{user.name}`\n(`{user.id}`)", inline=True)
+    embed.add_field(name="Timestamp", value=f"`{current_time}`", inline=True)
     
-    embed.set_footer(text="🔴 Whitelist System")
-    await ch.send(embed=embed)
+    try:
+        await ch.send(embed=embed)
+    except Exception as e:
+        print(f"Log error: {e}")
 
 async def send_simple_log(bot, message: str):
-    """Simple text-based log"""
-    if not LOG_CHANNEL_ID:
-        return
-        
+    if not LOG_CHANNEL_ID: return
     ch = bot.get_channel(LOG_CHANNEL_ID)
     if ch:
-        await ch.send(f"`{datetime.now().strftime('%H:%M:%S')}` {message}")
+        try:
+            await ch.send(f"`{datetime.now().strftime('%H:%M:%S')}` {message}")
+        except: pass
 
 # ============================
 # FORMAT DATE
@@ -231,340 +188,152 @@ def format_box_date(raw):
 # ============================
 
 class CheckUIDModal(ui.Modal, title="🔍 ตรวจสอบ UID"):
-    uid_input = ui.TextInput(
-        label="UID",
-        placeholder="กรอก UID ที่ต้องการตรวจสอบ",
-        required=True,
-        max_length=50
-    )
+    uid_input = ui.TextInput(label="UID", placeholder="กรอก UID ที่ต้องการตรวจสอบ", required=True, max_length=50)
     
     async def on_submit(self, interaction: discord.Interaction):
+        # defer interaction ทันทีเพื่อป้องกัน Timeout 3 วินาที
+        await interaction.response.defer(ephemeral=True)
         uid = self.uid_input.value.strip()
-        entry = get_uid_entry(uid)
+        entry = await get_uid_entry(uid)
         
         if not entry:
-            embed = discord.Embed(
-                title="❌ ไม่พบ UID",
-                description=f"UID `{uid}` ไม่อยู่ในระบบ",
-                color=COLOR_ERROR
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            embed = discord.Embed(title="❌ ไม่พบ UID", description=f"UID `{uid}` ไม่อยู่ในระบบ", color=COLOR_ERROR)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             return
         
-        pretty = format_box_date(entry["expiry_date"])
-        embed = discord.Embed(
-            title="📦 ข้อมูล WHITELIST",
-            color=COLOR_PRIMARY
-        )
+        embed = discord.Embed(title="📦 ข้อมูล WHITELIST", color=COLOR_PRIMARY)
         embed.add_field(name="🔑 UID", value=f"`{entry['uid']}`", inline=False)
-        embed.add_field(name="📅 วันหมดอายุ", value=f"`{pretty}`", inline=True)
+        embed.add_field(name="📅 วันหมดอายุ", value=f"`{format_box_date(entry['expiry_date'])}`", inline=True)
         embed.add_field(name="📝 หมายเหตุ", value=f"`{entry['comment']}`", inline=True)
         embed.set_footer(text="🔴 Whitelist System")
-        
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-
+        await interaction.followup.send(embed=embed, ephemeral=True)
 
 class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
-    uid_input = ui.TextInput(
-        label="UID",
-        placeholder="กรอก UID",
-        required=True,
-        max_length=50
-    )
-    year_input = ui.TextInput(
-        label="ปี (Year)",
-        placeholder="เช่น 2025",
-        required=True,
-        max_length=4
-    )
-    month_input = ui.TextInput(
-        label="เดือน (Month)",
-        placeholder="เช่น 12",
-        required=True,
-        max_length=2
-    )
-    day_input = ui.TextInput(
-        label="วัน (Day)",
-        placeholder="เช่น 31",
-        required=True,
-        max_length=2
-    )
-    comment_input = ui.TextInput(
-        label="หมายเหตุ (Comment)",
-        placeholder="กรอกหมายเหตุ",
-        required=True,
-        max_length=100
-    )
+    uid_input = ui.TextInput(label="UID", placeholder="กรอก UID", required=True, max_length=50)
+    year_input = ui.TextInput(label="ปี (Year)", placeholder="เช่น 2025", required=True, max_length=4)
+    month_input = ui.TextInput(label="เดือน (Month)", placeholder="เช่น 12", required=True, max_length=2)
+    day_input = ui.TextInput(label="วัน (Day)", placeholder="เช่น 31", required=True, max_length=2)
+    comment_input = ui.TextInput(label="หมายเหตุ (Comment)", placeholder="กรอกหมายเหตุ", required=True, max_length=100)
     
     async def on_submit(self, interaction: discord.Interaction):
-        global WHITELIST_PAUSED
-        
-        if WHITELIST_PAUSED:
-            embed = discord.Embed(
-                title="⚠️ ระบบถูกหยุดชั่วคราว",
-                description="ไม่สามารถเพิ่ม UID ได้ในขณะนี้",
-                color=COLOR_WARNING
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-        
+        await interaction.response.defer(ephemeral=True)
         try:
             uid = self.uid_input.value.strip()
             year = int(self.year_input.value.strip())
             month = int(self.month_input.value.strip())
             day = int(self.day_input.value.strip())
             comment = self.comment_input.value.strip()
-            
             expiry = f"{year:04d}-{month:02d}-{day:02d}"
             
-            existing_entry = get_uid_entry(uid)
-            action = "updated" if existing_entry else "added"
-            
-            success = add_uid_entry(uid, expiry, comment)
+            existing_entry = await get_uid_entry(uid)
+            success = await add_uid_entry(uid, expiry, comment)
             
             if success:
-                if action == "added":
-                    embed = discord.Embed(
-                        title="✅ เพิ่ม UID สำเร็จ",
-                        description=f"UID `{uid}` ถูกเพิ่มเรียบร้อยแล้ว",
-                        color=COLOR_SUCCESS
-                    )
-                else:
-                    embed = discord.Embed(
-                        title="🔄 อัพเดท UID สำเร็จ",
-                        description=f"UID `{uid}` ถูกอัพเดทเรียบร้อยแล้ว",
-                        color=COLOR_WARNING
-                    )
+                status_text = "อัพเดท" if existing_entry else "เพิ่ม"
+                embed = discord.Embed(title=f"✅ {status_text} UID สำเร็จ", color=COLOR_SUCCESS if not existing_entry else COLOR_WARNING)
+                embed.description = f"UID `{uid}` ถูกดำเนินการเรียบร้อยแล้ว"
                 embed.add_field(name="📅 วันหมดอายุ", value=f"`{format_box_date(expiry)}`", inline=True)
                 embed.add_field(name="📝 หมายเหตุ", value=f"`{comment}`", inline=True)
-                embed.set_footer(text="🔴 Whitelist System")
-                
-                await interaction.response.send_message(embed=embed, ephemeral=True)
+                await interaction.followup.send(embed=embed, ephemeral=True)
                 await send_log(interaction.client, "ADD", uid, interaction.user, expiry, comment)
             else:
-                embed = discord.Embed(
-                    title="❌ เกิดข้อผิดพลาด",
-                    description="ไม่สามารถบันทึกข้อมูลได้",
-                    color=COLOR_ERROR
-                )
-                await interaction.response.send_message(embed=embed, ephemeral=True)
-                
+                await interaction.followup.send("❌ เกิดข้อผิดพลาดในการบันทึกข้อมูล", ephemeral=True)
         except ValueError:
-            embed = discord.Embed(
-                title="❌ รูปแบบไม่ถูกต้อง",
-                description="กรุณากรอกปี เดือน วัน เป็นตัวเลข",
-                color=COLOR_ERROR
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-
+            await interaction.followup.send("❌ รูปแบบวันที่ไม่ถูกต้อง (ต้องเป็นตัวเลข)", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
 
 class RemoveUIDModal(ui.Modal, title="🗑️ ลบ UID"):
-    uid_input = ui.TextInput(
-        label="UID",
-        placeholder="กรอก UID ที่ต้องการลบ",
-        required=True,
-        max_length=50
-    )
+    uid_input = ui.TextInput(label="UID", placeholder="กรอก UID ที่ต้องการลบ", required=True, max_length=50)
     
     async def on_submit(self, interaction: discord.Interaction):
-        global WHITELIST_PAUSED
-        
-        if WHITELIST_PAUSED:
-            embed = discord.Embed(
-                title="⚠️ ระบบถูกหยุดชั่วคราว",
-                description="ไม่สามารถลบ UID ได้ในขณะนี้",
-                color=COLOR_WARNING
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-        
+        await interaction.response.defer(ephemeral=True)
         uid = self.uid_input.value.strip()
-        success = remove_uid_entry(uid)
+        success = await remove_uid_entry(uid)
         
         if success:
-            embed = discord.Embed(
-                title="🗑️ ลบ UID สำเร็จ",
-                description=f"UID `{uid}` ถูกลบเรียบร้อยแล้ว",
-                color=COLOR_SUCCESS
-            )
-            embed.set_footer(text="🔴 Whitelist System")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            embed = discord.Embed(title="🗑️ ลบ UID สำเร็จ", description=f"UID `{uid}` ถูกลบแล้ว", color=COLOR_SUCCESS)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             await send_log(interaction.client, "REMOVE", uid, interaction.user)
         else:
-            embed = discord.Embed(
-                title="❌ ไม่พบ UID",
-                description=f"UID `{uid}` ไม่อยู่ในระบบ",
-                color=COLOR_ERROR
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-
+            await interaction.followup.send(f"❌ ไม่พบ UID `{uid}` ในระบบ", ephemeral=True)
 
 class ChangeUIDModal(ui.Modal, title="🔄 เปลี่ยน UID"):
-    old_uid_input = ui.TextInput(
-        label="UID เก่า",
-        placeholder="กรอก UID เก่าที่ต้องการเปลี่ยน",
-        required=True,
-        max_length=50
-    )
-    new_uid_input = ui.TextInput(
-        label="UID ใหม่",
-        placeholder="กรอก UID ใหม่",
-        required=True,
-        max_length=50
-    )
+    old_uid_input = ui.TextInput(label="UID เก่า", placeholder="กรอก UID เก่า", required=True)
+    new_uid_input = ui.TextInput(label="UID ใหม่", placeholder="กรอก UID ใหม่", required=True)
     
     async def on_submit(self, interaction: discord.Interaction):
-        global WHITELIST_PAUSED
-        
-        if WHITELIST_PAUSED:
-            embed = discord.Embed(
-                title="⚠️ ระบบถูกหยุดชั่วคราว",
-                description="ไม่สามารถเปลี่ยน UID ได้ในขณะนี้",
-                color=COLOR_WARNING
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            return
-        
+        await interaction.response.defer(ephemeral=True)
         old_uid = self.old_uid_input.value.strip()
         new_uid = self.new_uid_input.value.strip()
         
         if old_uid == new_uid:
-            embed = discord.Embed(
-                title="❌ ข้อผิดพลาด",
-                description="UID เก่าและใหม่ต้องไม่เหมือนกัน",
-                color=COLOR_ERROR
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await interaction.followup.send("❌ UID ใหม่ต้องไม่ซ้ำกับอันเดิม", ephemeral=True)
             return
-        
-        success, status = change_uid_entry(old_uid, new_uid)
-        
+
+        success, status = await change_uid_entry(old_uid, new_uid)
         if success:
-            embed = discord.Embed(
-                title="✅ เปลี่ยน UID สำเร็จ",
-                description=f"เปลี่ยน UID จาก `{old_uid}` เป็น `{new_uid}` เรียบร้อยแล้ว",
-                color=COLOR_SUCCESS
-            )
-            embed.set_footer(text="🔴 Whitelist System")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
+            embed = discord.Embed(title="✅ เปลี่ยน UID สำเร็จ", description=f"จาก `{old_uid}` เป็น `{new_uid}`", color=COLOR_SUCCESS)
+            await interaction.followup.send(embed=embed, ephemeral=True)
             await send_log(interaction.client, "CHANGE", new_uid, interaction.user, old_uid=old_uid)
         else:
-            if status == "OLD_UID_NOT_FOUND":
-                embed = discord.Embed(
-                    title="❌ ไม่พบ UID เก่า",
-                    description=f"UID `{old_uid}` ไม่อยู่ในระบบ",
-                    color=COLOR_ERROR
-                )
-            elif status == "NEW_UID_EXISTS":
-                embed = discord.Embed(
-                    title="❌ UID ใหม่มีอยู่แล้ว",
-                    description=f"UID `{new_uid}` มีอยู่ในระบบแล้ว",
-                    color=COLOR_ERROR
-                )
-            else:
-                embed = discord.Embed(
-                    title="❌ เกิดข้อผิดพลาด",
-                    description="ไม่สามารถเปลี่ยน UID ได้",
-                    color=COLOR_ERROR
-                )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-
+            msg = "ไม่พบ UID เก่า" if status == "OLD_UID_NOT_FOUND" else "UID ใหม่มีในระบบแล้ว" if status == "NEW_UID_EXISTS" else "บันทึกล้มเหลว"
+            await interaction.followup.send(f"❌ {msg}", ephemeral=True)
 
 # ============================
-# MAIN MENU VIEW (BUTTONS)
+# MAIN MENU VIEW (STABLE VERSION)
 # ============================
 
 class MainMenuView(ui.View):
     def __init__(self):
+        # กำหนด timeout=None เพื่อให้ปุ่มอยู่ถาวร (Persistent View)
         super().__init__(timeout=None)
     
-    @ui.button(label="🔍 ตรวจสอบ UID", style=discord.ButtonStyle.danger, custom_id="check_uid", row=0)
+    @ui.button(label="🔍 ตรวจสอบ UID", style=discord.ButtonStyle.danger, custom_id="persistent:check_uid", row=0)
     async def check_uid_button(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(CheckUIDModal())
     
-    @ui.button(label="📋 ดู UID ทั้งหมด", style=discord.ButtonStyle.danger, custom_id="list_uids", row=0)
+    @ui.button(label="📋 ดู UID ทั้งหมด", style=discord.ButtonStyle.danger, custom_id="persistent:list_uids", row=0)
     async def list_uids_button(self, interaction: discord.Interaction, button: ui.Button):
+        await interaction.response.defer(ephemeral=True)
         try:
-            data = get_all_uids()
-            
+            data = await get_whitelist_data()
             if not data:
-                embed = discord.Embed(
-                    title="📋 รายการ UID",
-                    description="ไม่มี UID ในระบบ",
-                    color=COLOR_INFO
-                )
-                await interaction.response.send_message(embed=embed, ephemeral=True)
+                await interaction.followup.send("📋 ไม่มีข้อมูล UID ในระบบ", ephemeral=True)
                 return
             
-            embed = discord.Embed(
-                title="📋 รายการ UID ทั้งหมด",
-                color=COLOR_PRIMARY
-            )
+            embed = discord.Embed(title="📋 รายการ UID ทั้งหมด", color=COLOR_PRIMARY)
+            uid_chunks = []
+            current_chunk = ""
             
-            # แบ่งเป็นหลาย field ถ้ามีข้อมูลมาก
-            uid_list = ""
-            for i, entry in enumerate(data):
-                line = f"`{entry['uid']}` - {format_box_date(entry['expiry_date'])} - {entry['comment']}\n"
-                if len(uid_list) + len(line) > 1000:
-                    embed.add_field(name="📦 UIDs", value=uid_list, inline=False)
-                    uid_list = line
+            for entry in data:
+                line = f"`{entry['uid']}` | {format_box_date(entry['expiry_date'])} | {entry['comment']}\n"
+                if len(current_chunk) + len(line) > 1024:
+                    uid_chunks.append(current_chunk)
+                    current_chunk = line
                 else:
-                    uid_list += line
-            
-            if uid_list:
-                embed.add_field(name="📦 UIDs", value=uid_list, inline=False)
+                    current_chunk += line
+            if current_chunk: uid_chunks.append(current_chunk)
+
+            for i, chunk in enumerate(uid_chunks):
+                embed.add_field(name=f"📦 รายการที่ {i+1}", value=chunk, inline=False)
             
             embed.set_footer(text=f"🔴 ทั้งหมด {len(data)} รายการ")
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-            
+            await interaction.followup.send(embed=embed, ephemeral=True)
         except Exception as e:
-            embed = discord.Embed(
-                title="❌ เกิดข้อผิดพลาด",
-                description="ไม่สามารถเชื่อมต่อฐานข้อมูลได้",
-                color=COLOR_ERROR
-            )
-            await interaction.response.send_message(embed=embed, ephemeral=True)
-    
-    @ui.button(label="➕ เพิ่ม UID", style=discord.ButtonStyle.danger, custom_id="add_uid", row=1)
+            await interaction.followup.send(f"❌ Error: {str(e)}", ephemeral=True)
+
+    @ui.button(label="➕ เพิ่ม UID", style=discord.ButtonStyle.danger, custom_id="persistent:add_uid", row=1)
     async def add_uid_button(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(AddUIDModal())
     
-    @ui.button(label="🔄 เปลี่ยน UID", style=discord.ButtonStyle.danger, custom_id="change_uid", row=1)
+    @ui.button(label="🔄 เปลี่ยน UID", style=discord.ButtonStyle.danger, custom_id="persistent:change_uid", row=1)
     async def change_uid_button(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(ChangeUIDModal())
     
-    @ui.button(label="🗑️ ลบ UID", style=discord.ButtonStyle.secondary, custom_id="remove_uid", row=2)
+    @ui.button(label="🗑️ ลบ UID", style=discord.ButtonStyle.secondary, custom_id="persistent:remove_uid", row=2)
     async def remove_uid_button(self, interaction: discord.Interaction, button: ui.Button):
         await interaction.response.send_modal(RemoveUIDModal())
-    
-    @ui.button(label="⏸️ หยุดระบบ", style=discord.ButtonStyle.secondary, custom_id="pause_system", row=2)
-    async def pause_button(self, interaction: discord.Interaction, button: ui.Button):
-        global WHITELIST_PAUSED
-        
-        WHITELIST_PAUSED = True
-        embed = discord.Embed(
-            title="⏸️ หยุดระบบชั่วคราว",
-            description="ระบบ Whitelist ถูกหยุดชั่วคราวแล้ว",
-            color=COLOR_WARNING
-        )
-        embed.set_footer(text="🔴 Whitelist System")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        await send_log(interaction.client, "PAUSE", "", interaction.user)
-    
-    @ui.button(label="▶️ เปิดระบบ", style=discord.ButtonStyle.secondary, custom_id="resume_system", row=2)
-    async def resume_button(self, interaction: discord.Interaction, button: ui.Button):
-        global WHITELIST_PAUSED
-        
-        WHITELIST_PAUSED = False
-        embed = discord.Embed(
-            title="▶️ เปิดระบบ",
-            description="ระบบ Whitelist กลับมาทำงานแล้ว",
-            color=COLOR_SUCCESS
-        )
-        embed.set_footer(text="🔴 Whitelist System")
-        await interaction.response.send_message(embed=embed, ephemeral=True)
-        await send_log(interaction.client, "RESUME", "", interaction.user)
-
 
 # ============================
 # BOT CLASS
@@ -576,59 +345,47 @@ class MyBot(discord.Client):
 
     async def on_ready(self):
         print(f"[READY] Logged in as {self.user}")
-        
-        # Register persistent view
+        # ลงทะเบียน persistent view เพื่อให้ปุ่มรันได้ตลอดแม้บอทรีสตาร์ท
         self.add_view(MainMenuView())
         
         try:
-            cmds = await self.tree.sync()
-            print(f"Synced {len(cmds)} commands.")
-            await send_simple_log(self, "🔴 **Bot Started Successfully**")
+            await self.tree.sync()
+            print("Commands Synced.")
+            await send_simple_log(self, "🔴 **Bot System Online**")
         except Exception as e:
-            print(f"Error syncing commands: {e}")
+            print(f"Sync error: {e}")
 
     async def setup_hook(self):
-        print("[SETUP] Bot is starting up...")
+        # เรียกใช้ตอนบอทเริ่มทำงาน
+        print("[SETUP] Preparing environment...")
 
 bot = MyBot()
 
 # ============================
-# /menu - SHOW MAIN MENU WITH BUTTONS
+# COMMANDS
 # ============================
 @bot.tree.command(name="menu", description="แสดงเมนูหลัก Whitelist System")
 async def menu_cmd(interaction: discord.Interaction):
     if ALLOWED_CHANNEL and interaction.channel_id != ALLOWED_CHANNEL:
-        await interaction.response.send_message(
-            "❌ คุณสามารถใช้คำสั่งได้เฉพาะในช่องที่กำหนดเท่านั้น",
-            ephemeral=True
-        )
+        await interaction.response.send_message("❌ ไม่อนุญาตให้ใช้คำสั่งในห้องนี้", ephemeral=True)
         return
     
     embed = discord.Embed(
         title="🔴 WHITELIST SYSTEM",
         description=(
-            "**ยินดีต้อนรับสู่ระบบจัดการ Whitelist**\n\n"
-            "กรุณาเลือกการดำเนินการจากปุ่มด้านล่าง:\n\n"
-            "🔍 **ตรวจสอบ UID** - ค้นหาข้อมูล UID\n"
-            "📋 **ดู UID ทั้งหมด** - แสดงรายการ UID ทั้งหมด\n"
-            "➕ **เพิ่ม UID** - เพิ่ม UID ใหม่เข้าระบบ\n"
-            "🔄 **เปลี่ยน UID** - เปลี่ยน UID เก่าเป็น UID ใหม่\n"
-            "🗑️ **ลบ UID** - ลบ UID ออกจากระบบ\n"
-            "⏸️ **หยุดระบบ** - หยุดระบบชั่วคราว\n"
-            "▶️ **เปิดระบบ** - เปิดระบบอีกครั้ง"
+            "**ระบบจัดการ Whitelist (Array Mode)**\n\n"
+            "🔍 **ตรวจสอบ UID** - ค้นหาข้อมูลรายตัว\n"
+            "📋 **ดู UID ทั้งหมด** - แสดงรายการที่มีทั้งหมด\n"
+            "➕ **เพิ่ม UID** - ลงทะเบียนใหม่\n"
+            "🔄 **เปลี่ยน UID** - แก้ไขรหัสเดิม\n"
+            "🗑️ **ลบ UID** - นำข้อมูลออก"
         ),
         color=COLOR_PRIMARY
     )
-    embed.set_footer(text="🔴 Whitelist System | เลือกปุ่มด้านล่างเพื่อดำเนินการ")
+    embed.set_footer(text="🔴 Whitelist System | เลือกเมนูด้านล่าง")
     
-    # Check system status
-    if WHITELIST_PAUSED:
-        embed.add_field(name="⚠️ สถานะระบบ", value="**หยุดชั่วคราว**", inline=False)
-    else:
-        embed.add_field(name="✅ สถานะระบบ", value="**ทำงานปกติ**", inline=False)
-    
+    # ส่งเมนูพร้อม View ที่ไม่มีปุ่ม Pause/Resume แล้ว
     await interaction.response.send_message(embed=embed, view=MainMenuView())
-
 
 # ============================
 # RUN BOT
