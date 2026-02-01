@@ -28,9 +28,11 @@ POINTS_PER_DAY = 5  # 1 วัน = 5 points
 required_vars = {
     "JSONBIN_URL": JSONBIN_URL,
     "JSONBIN_API_KEY": JSONBIN_API_KEY,
-    "DISCORD_BOT_TOKEN": BOT_TOKEN,
-    "POINTS_URL": POINTS_URL
+    "DISCORD_BOT_TOKEN": BOT_TOKEN
 }
+
+# POINTS_URL is optional - if not set, point system will be disabled
+POINTS_ENABLED = bool(POINTS_URL)
 
 missing_vars = [var for var, value in required_vars.items() if not value]
 if missing_vars:
@@ -437,36 +439,39 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
                 await interaction.response.send_message(embed=embed, ephemeral=True)
                 return
             
-            # คำนวณ points ที่ต้องใช้ (1 วัน = 5 points)
-            points_needed = calculate_points_needed(days)
-            user_id = str(interaction.user.id)
-            current_points = get_user_points(user_id)
-            
-            # ตรวจสอบว่ามี points เพียงพอหรือไม่
-            if current_points < points_needed:
-                embed = discord.Embed(
-                    title="❌ Points ไม่เพียงพอ",
-                    description=(
-                        f"คุณมี **{current_points}** points\n"
-                        f"ต้องการ **{points_needed}** points ({days} วัน x {POINTS_PER_DAY} points)\n"
-                        f"ขาดอีก **{points_needed - current_points}** points"
-                    ),
-                    color=COLOR_ERROR
-                )
-                await interaction.response.send_message(embed=embed, ephemeral=True)
-                return
-            
-            # หัก points
-            success_deduct, remaining_points = deduct_user_points(user_id, points_needed)
-            
-            if not success_deduct:
-                embed = discord.Embed(
-                    title="❌ Points ไม่เพียงพอ",
-                    description="เกิดข้อผิดพลาดในการหัก points",
-                    color=COLOR_ERROR
-                )
-                await interaction.response.send_message(embed=embed, ephemeral=True)
-                return
+            # ตรวจสอบและหัก points (ถ้าเปิดใช้งานระบบ points)
+            points_needed = 0
+            remaining_points = 0
+            if POINTS_ENABLED:
+                points_needed = calculate_points_needed(days)
+                user_id = str(interaction.user.id)
+                current_points = get_user_points(user_id)
+                
+                # ตรวจสอบว่ามี points เพียงพอหรือไม่
+                if current_points < points_needed:
+                    embed = discord.Embed(
+                        title="❌ Points ไม่เพียงพอ",
+                        description=(
+                            f"คุณมี **{current_points}** points\n"
+                            f"ต้องการ **{points_needed}** points ({days} วัน x {POINTS_PER_DAY} points)\n"
+                            f"ขาดอีก **{points_needed - current_points}** points"
+                        ),
+                        color=COLOR_ERROR
+                    )
+                    await interaction.response.send_message(embed=embed, ephemeral=True)
+                    return
+                
+                # หัก points
+                success_deduct, remaining_points = deduct_user_points(user_id, points_needed)
+                
+                if not success_deduct:
+                    embed = discord.Embed(
+                        title="❌ Points ไม่เพียงพอ",
+                        description="เกิดข้อผิดพลาดในการหัก points",
+                        color=COLOR_ERROR
+                    )
+                    await interaction.response.send_message(embed=embed, ephemeral=True)
+                    return
             
             # คำนวณวันหมดอายุจากวันนี้ + จำนวนวัน
             expiry_date = datetime.now() + timedelta(days=days)
@@ -494,18 +499,20 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
                 embed.add_field(name="📅 วันหมดอายุ", value=f"`{format_box_date(expiry)}`", inline=True)
                 embed.add_field(name="⏱️ จำนวนวัน", value=f"`{days} วัน`", inline=True)
                 embed.add_field(name="📝 หมายเหตุ", value=f"`{comment}`", inline=True)
-                embed.add_field(name="💰 หัก Points", value=f"`-{points_needed}`", inline=True)
-                embed.add_field(name="💳 คงเหลือ", value=f"`{remaining_points}` points", inline=True)
+                if POINTS_ENABLED:
+                    embed.add_field(name="💰 หัก Points", value=f"`-{points_needed}`", inline=True)
+                    embed.add_field(name="💳 คงเหลือ", value=f"`{remaining_points}` points", inline=True)
                 embed.set_footer(text="🔴 Whitelist System")
                 
                 await interaction.response.send_message(embed=embed, ephemeral=True)
                 await send_log(interaction.client, "ADD", uid, interaction.user, expiry, comment)
             else:
                 # คืน points ถ้าเพิ่ม UID ไม่สำเร็จ
-                add_user_points(user_id, points_needed)
+                if POINTS_ENABLED:
+                    add_user_points(str(interaction.user.id), points_needed)
                 embed = discord.Embed(
                     title="❌ เกิดข้อผิดพลาด",
-                    description="ไม่สามารถบันทึกข้อมูลได้ (points ถูกคืนแล้ว)",
+                    description="ไม่สามารถบันทึกข้อมูลได้" + (" (points ถูกคืนแล้ว)" if POINTS_ENABLED else ""),
                     color=COLOR_ERROR
                 )
                 await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -635,6 +642,69 @@ class ChangeUIDModal(ui.Modal, title="🔄 เปลี่ยน UID"):
 
 
 # ============================
+# ADD POINTS MODAL (Owner only)
+# ============================
+class AddPointsModal(ui.Modal, title="💰 เพิ่ม Points"):
+    user_id_input = ui.TextInput(
+        label="Discord User ID",
+        placeholder="กรอก User ID (เช่น 123456789012345678)",
+        required=True,
+        max_length=20
+    )
+    amount_input = ui.TextInput(
+        label="จำนวน Points",
+        placeholder="กรอกจำนวน Points ที่ต้องการเพิ่ม",
+        required=True,
+        max_length=10
+    )
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        if not POINTS_ENABLED:
+            embed = discord.Embed(
+                title="⚠️ ระบบ Points ไม่เปิดใช้งาน",
+                description="กรุณาตั้งค่า POINTS_URL ใน .env",
+                color=COLOR_WARNING
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        
+        try:
+            user_id = self.user_id_input.value.strip()
+            amount = int(self.amount_input.value.strip())
+            
+            if amount <= 0:
+                embed = discord.Embed(
+                    title="❌ จำนวนไม่ถูกต้อง",
+                    description="กรุณาระบุจำนวน Points มากกว่า 0",
+                    color=COLOR_ERROR
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+            
+            new_balance = add_user_points(user_id, amount)
+            
+            embed = discord.Embed(
+                title="✅ เพิ่ม Points สำเร็จ",
+                description=f"เพิ่ม **{amount}** points ให้ User ID: `{user_id}`",
+                color=COLOR_SUCCESS
+            )
+            embed.add_field(name="💰 เพิ่ม", value=f"`+{amount}` points", inline=True)
+            embed.add_field(name="💳 คงเหลือ", value=f"`{new_balance}` points", inline=True)
+            embed.set_footer(text="🔴 Point System")
+            
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            await send_simple_log(interaction.client, f"💰 **ADD POINTS** | {interaction.user.name} added {amount} points to {user_id} (Total: {new_balance})")
+            
+        except ValueError:
+            embed = discord.Embed(
+                title="❌ รูปแบบไม่ถูกต้อง",
+                description="กรุณากรอกจำนวน Points เป็นตัวเลข",
+                color=COLOR_ERROR
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+# ============================
 # MAIN MENU VIEW (BUTTONS)
 # ============================
 
@@ -748,9 +818,33 @@ class MainMenuView(ui.View):
         await interaction.response.send_message(embed=embed, ephemeral=True)
         await send_log(interaction.client, "RESUME", "", interaction.user)
     
+    @ui.button(label="💰 เพิ่ม Points", style=discord.ButtonStyle.success, custom_id="add_points", row=3)
+    async def add_points_button(self, interaction: discord.Interaction, button: ui.Button):
+        """Add points to a user (Server Owner only)"""
+        # ตรวจสอบว่าเป็นเจ้าของเซิร์ฟเวอร์หรือไม่
+        if interaction.guild is None or interaction.user.id != interaction.guild.owner_id:
+            embed = discord.Embed(
+                title="❌ ไม่มีสิทธิ์",
+                description="เฉพาะเจ้าของเซิร์ฟเวอร์เท่านั้นที่สามารถเพิ่ม Points ได้",
+                color=COLOR_ERROR
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        
+        await interaction.response.send_modal(AddPointsModal())
+    
     @ui.button(label="💳 Points ของฉัน", style=discord.ButtonStyle.success, custom_id="my_points", row=3)
     async def my_points_button(self, interaction: discord.Interaction, button: ui.Button):
         """Show user's points balance"""
+        if not POINTS_ENABLED:
+            embed = discord.Embed(
+                title="⚠️ ระบบ Points ไม่เปิดใช้งาน",
+                description="ระบบ Points ไม่ได้เปิดใช้งาน",
+                color=COLOR_WARNING
+            )
+            await interaction.response.send_message(embed=embed, ephemeral=True)
+            return
+        
         user_id = str(interaction.user.id)
         points = get_user_points(user_id)
         days_available = points // POINTS_PER_DAY
@@ -814,9 +908,12 @@ class MyBot(discord.Client):
         print("[STARTUP] Loading cache from JSONBin...")
         load_cache_from_jsonbin()
         
-        # Load points from storage
-        print("[STARTUP] Loading points from storage...")
-        load_points_from_storage()
+        # Load points from storage (if enabled)
+        if POINTS_ENABLED:
+            print("[STARTUP] Loading points from storage...")
+            load_points_from_storage()
+        else:
+            print("[STARTUP] Points system is disabled (POINTS_URL not set)")
         
         # Register persistent view
         self.add_view(MainMenuView())
@@ -857,6 +954,8 @@ async def menu_cmd(interaction: discord.Interaction):
             "🗑️ **ลบ UID** - ลบ UID ออกจากระบบ\n"
             "⏸️ **หยุดระบบ** - หยุดระบบชั่วคราว (Owner)\n"
             "▶️ **เปิดระบบ** - เปิดระบบอีกครั้ง (Owner)\n"
+            "💰 **เพิ่ม Points** - เพิ่ม Points ให้ User (Server Owner)
+\n"
             "💳 **Points ของฉัน** - ดู Points คงเหลือ\n"
             "🔄 **Sync ข้อมูล** - โหลดข้อมูลใหม่ (Owner)\n\n"
             f"**อัตราแลก:** `{POINTS_PER_DAY}` points = 1 วัน"
@@ -877,6 +976,15 @@ async def menu_cmd(interaction: discord.Interaction):
     amount="จำนวน points ที่ต้องการเพิ่ม"
 )
 async def addpoint_cmd(interaction: discord.Interaction, user: discord.User, amount: int):
+    if not POINTS_ENABLED:
+        embed = discord.Embed(
+            title="⚠️ ระบบ Points ไม่เปิดใช้งาน",
+            description="กรุณาตั้งค่า POINTS_URL ใน .env",
+            color=COLOR_WARNING
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    
     if interaction.user.id != DEV_ID:
         embed = discord.Embed(
             title="❌ ไม่มีสิทธิ์",
@@ -915,6 +1023,15 @@ async def addpoint_cmd(interaction: discord.Interaction, user: discord.User, amo
 # ============================
 @bot.tree.command(name="mypoints", description="ดู points ของตัวเอง")
 async def mypoints_cmd(interaction: discord.Interaction):
+    if not POINTS_ENABLED:
+        embed = discord.Embed(
+            title="⚠️ ระบบ Points ไม่เปิดใช้งาน",
+            description="กรุณาตั้งค่า POINTS_URL ใน .env",
+            color=COLOR_WARNING
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    
     user_id = str(interaction.user.id)
     points = get_user_points(user_id)
     
@@ -938,6 +1055,15 @@ async def mypoints_cmd(interaction: discord.Interaction):
 @bot.tree.command(name="checkpoints", description="ดู points ของผู้ใช้อื่น (Owner เท่านั้น)")
 @app_commands.describe(user="ผู้ใช้ที่ต้องการตรวจสอบ")
 async def checkpoints_cmd(interaction: discord.Interaction, user: discord.User):
+    if not POINTS_ENABLED:
+        embed = discord.Embed(
+            title="⚠️ ระบบ Points ไม่เปิดใช้งาน",
+            description="กรุณาตั้งค่า POINTS_URL ใน .env",
+            color=COLOR_WARNING
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    
     if interaction.user.id != DEV_ID:
         embed = discord.Embed(
             title="❌ ไม่มีสิทธิ์",
