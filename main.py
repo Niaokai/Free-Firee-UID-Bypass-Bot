@@ -20,11 +20,16 @@ LOG_CHANNEL_ID = int(os.getenv("LOG_CHANNEL_ID", "0"))
 DEV_ID = int(os.getenv("DEV_DISCORD_ID", "0"))
 ALLOWED_CHANNEL = int(os.getenv("ALLOWED_CHANNEL", "0"))
 
+# Point System - Pastebin URL
+POINTS_URL = os.getenv("POINTS_URL")  # https://pastebin.com/raw/yYXXzvmg
+POINTS_PER_DAY = 5  # 1 วัน = 5 points
+
 # Validate required environment variables
 required_vars = {
     "JSONBIN_URL": JSONBIN_URL,
     "JSONBIN_API_KEY": JSONBIN_API_KEY,
-    "DISCORD_BOT_TOKEN": BOT_TOKEN
+    "DISCORD_BOT_TOKEN": BOT_TOKEN,
+    "POINTS_URL": POINTS_URL
 }
 
 missing_vars = [var for var, value in required_vars.items() if not value]
@@ -54,6 +59,10 @@ COLOR_INFO = 0xCD5C5C        # Indian Red (Info)
 WHITELIST_CACHE = []
 CACHE_LOCK = threading.Lock()
 CACHE_LOADED = False
+
+# Point System Cache
+POINTS_CACHE = {}  # {discord_user_id: points}
+POINTS_LOCK = threading.Lock()
 
 def load_cache_from_jsonbin():
     """Load data from JSONBin to local cache (called once at startup)"""
@@ -95,6 +104,90 @@ def sync_in_background():
     """Run sync in a separate thread to not block the bot"""
     thread = threading.Thread(target=sync_cache_to_jsonbin)
     thread.start()
+
+# ============================
+# POINTS SYSTEM FUNCTIONS
+# ============================
+
+# JSONBin Headers for Points (same API key)
+POINTS_HEADERS = {
+    "Content-Type": "application/json",
+    "X-Master-Key": JSONBIN_API_KEY,
+    "X-Bin-Meta": "false"
+}
+
+def load_points_from_storage():
+    """Load points data from storage"""
+    global POINTS_CACHE
+    try:
+        response = requests.get(POINTS_URL, headers=POINTS_HEADERS, timeout=30)
+        if response.status_code == 200:
+            data = response.json()
+            with POINTS_LOCK:
+                POINTS_CACHE = data if isinstance(data, dict) else {}
+            print(f"[POINTS] Loaded {len(POINTS_CACHE)} user points")
+            return True
+        else:
+            print(f"[POINTS] Error loading: {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"[POINTS] Error loading points: {e}")
+        return False
+
+def sync_points_to_storage():
+    """Sync points cache to storage"""
+    try:
+        with POINTS_LOCK:
+            data_to_sync = POINTS_CACHE.copy()
+        
+        response = requests.put(POINTS_URL, headers=POINTS_HEADERS, json=data_to_sync, timeout=30)
+        if response.status_code == 200:
+            print(f"[POINTS] Synced {len(data_to_sync)} user points")
+            return True
+        else:
+            print(f"[POINTS] Error syncing: {response.status_code}")
+            return False
+    except Exception as e:
+        print(f"[POINTS] Error syncing points: {e}")
+        return False
+
+def sync_points_in_background():
+    """Run points sync in background"""
+    thread = threading.Thread(target=sync_points_to_storage)
+    thread.start()
+
+def get_user_points(user_id: str) -> int:
+    """Get points for a user (instant from cache)"""
+    with POINTS_LOCK:
+        return POINTS_CACHE.get(str(user_id), 0)
+
+def add_user_points(user_id: str, amount: int) -> int:
+    """Add points to a user and return new balance"""
+    global POINTS_CACHE
+    with POINTS_LOCK:
+        user_id = str(user_id)
+        current = POINTS_CACHE.get(user_id, 0)
+        new_balance = current + amount
+        POINTS_CACHE[user_id] = new_balance
+    sync_points_in_background()
+    return new_balance
+
+def deduct_user_points(user_id: str, amount: int) -> tuple[bool, int]:
+    """Deduct points from user. Returns (success, remaining_balance)"""
+    global POINTS_CACHE
+    with POINTS_LOCK:
+        user_id = str(user_id)
+        current = POINTS_CACHE.get(user_id, 0)
+        if current < amount:
+            return False, current
+        new_balance = current - amount
+        POINTS_CACHE[user_id] = new_balance
+    sync_points_in_background()
+    return True, new_balance
+
+def calculate_points_needed(days: int) -> int:
+    """Calculate points needed for given days"""
+    return days * POINTS_PER_DAY
 
 # ============================
 # FAST CACHE FUNCTIONS (NO API CALLS)
@@ -344,6 +437,37 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
                 await interaction.response.send_message(embed=embed, ephemeral=True)
                 return
             
+            # คำนวณ points ที่ต้องใช้ (1 วัน = 5 points)
+            points_needed = calculate_points_needed(days)
+            user_id = str(interaction.user.id)
+            current_points = get_user_points(user_id)
+            
+            # ตรวจสอบว่ามี points เพียงพอหรือไม่
+            if current_points < points_needed:
+                embed = discord.Embed(
+                    title="❌ Points ไม่เพียงพอ",
+                    description=(
+                        f"คุณมี **{current_points}** points\n"
+                        f"ต้องการ **{points_needed}** points ({days} วัน x {POINTS_PER_DAY} points)\n"
+                        f"ขาดอีก **{points_needed - current_points}** points"
+                    ),
+                    color=COLOR_ERROR
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+            
+            # หัก points
+            success_deduct, remaining_points = deduct_user_points(user_id, points_needed)
+            
+            if not success_deduct:
+                embed = discord.Embed(
+                    title="❌ Points ไม่เพียงพอ",
+                    description="เกิดข้อผิดพลาดในการหัก points",
+                    color=COLOR_ERROR
+                )
+                await interaction.response.send_message(embed=embed, ephemeral=True)
+                return
+            
             # คำนวณวันหมดอายุจากวันนี้ + จำนวนวัน
             expiry_date = datetime.now() + timedelta(days=days)
             expiry = expiry_date.strftime("%Y-%m-%d")
@@ -370,14 +494,18 @@ class AddUIDModal(ui.Modal, title="➕ เพิ่ม UID"):
                 embed.add_field(name="📅 วันหมดอายุ", value=f"`{format_box_date(expiry)}`", inline=True)
                 embed.add_field(name="⏱️ จำนวนวัน", value=f"`{days} วัน`", inline=True)
                 embed.add_field(name="📝 หมายเหตุ", value=f"`{comment}`", inline=True)
+                embed.add_field(name="💰 หัก Points", value=f"`-{points_needed}`", inline=True)
+                embed.add_field(name="💳 คงเหลือ", value=f"`{remaining_points}` points", inline=True)
                 embed.set_footer(text="🔴 Whitelist System")
                 
                 await interaction.response.send_message(embed=embed, ephemeral=True)
                 await send_log(interaction.client, "ADD", uid, interaction.user, expiry, comment)
             else:
+                # คืน points ถ้าเพิ่ม UID ไม่สำเร็จ
+                add_user_points(user_id, points_needed)
                 embed = discord.Embed(
                     title="❌ เกิดข้อผิดพลาด",
-                    description="ไม่สามารถบันทึกข้อมูลได้",
+                    description="ไม่สามารถบันทึกข้อมูลได้ (points ถูกคืนแล้ว)",
                     color=COLOR_ERROR
                 )
                 await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -620,6 +748,24 @@ class MainMenuView(ui.View):
         await interaction.response.send_message(embed=embed, ephemeral=True)
         await send_log(interaction.client, "RESUME", "", interaction.user)
     
+    @ui.button(label="💳 Points ของฉัน", style=discord.ButtonStyle.success, custom_id="my_points", row=3)
+    async def my_points_button(self, interaction: discord.Interaction, button: ui.Button):
+        """Show user's points balance"""
+        user_id = str(interaction.user.id)
+        points = get_user_points(user_id)
+        days_available = points // POINTS_PER_DAY
+        
+        embed = discord.Embed(
+            title="💳 Points ของคุณ",
+            description=f"คุณมี **{points}** points",
+            color=COLOR_PRIMARY
+        )
+        embed.add_field(name="💰 อัตราแลก", value=f"`{POINTS_PER_DAY}` points = 1 วัน", inline=True)
+        embed.add_field(name="📅 เพิ่มได้", value=f"`{days_available}` วัน", inline=True)
+        embed.set_footer(text="🔴 Point System")
+        
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+    
     @ui.button(label="🔄 Sync ข้อมูล", style=discord.ButtonStyle.secondary, custom_id="force_sync", row=3)
     async def force_sync_button(self, interaction: discord.Interaction, button: ui.Button):
         """Force sync data from JSONBin to refresh cache"""
@@ -668,6 +814,10 @@ class MyBot(discord.Client):
         print("[STARTUP] Loading cache from JSONBin...")
         load_cache_from_jsonbin()
         
+        # Load points from storage
+        print("[STARTUP] Loading points from storage...")
+        load_points_from_storage()
+        
         # Register persistent view
         self.add_view(MainMenuView())
         
@@ -702,19 +852,115 @@ async def menu_cmd(interaction: discord.Interaction):
             "กรุณาเลือกฟังก์ชันที่ต้องการจากปุ่มด้านล่าง\n\n"
             "🔍 **ตรวจสอบ UID** - ค้นหาข้อมูล UID\n"
             "📋 **ดู UID ทั้งหมด** - แสดงรายการ UID ทั้งหมด\n"
-            "➕ **เพิ่ม UID** - เพิ่ม UID ใหม่เข้าระบบ\n"
+            "➕ **เพิ่ม UID** - เพิ่ม UID (หัก Points)\n"
             "🔄 **เปลี่ยน UID** - เปลี่ยน UID เก่าเป็น UID ใหม่\n"
             "🗑️ **ลบ UID** - ลบ UID ออกจากระบบ\n"
             "⏸️ **หยุดระบบ** - หยุดระบบชั่วคราว (Owner)\n"
             "▶️ **เปิดระบบ** - เปิดระบบอีกครั้ง (Owner)\n"
-            "🔄 **Sync ข้อมูล** - โหลดข้อมูลใหม่จาก JSONBin (Owner)"
+            "💳 **Points ของฉัน** - ดู Points คงเหลือ\n"
+            "🔄 **Sync ข้อมูล** - โหลดข้อมูลใหม่ (Owner)\n\n"
+            f"**อัตราแลก:** `{POINTS_PER_DAY}` points = 1 วัน"
         ),
         color=COLOR_PRIMARY
     )
-    embed.set_footer(text="🔴 Whitelist System | Button-Based Interface")
+    embed.set_footer(text="🔴 Whitelist System | Point-Based")
     
     await interaction.response.send_message(embed=embed, view=MainMenuView())
 
+
+# ============================
+# /addpoint COMMAND (Owner only)
+# ============================
+@bot.tree.command(name="addpoint", description="เพิ่ม points ให้ผู้ใช้ (Owner เท่านั้น)")
+@app_commands.describe(
+    user="ผู้ใช้ที่ต้องการเพิ่ม points",
+    amount="จำนวน points ที่ต้องการเพิ่ม"
+)
+async def addpoint_cmd(interaction: discord.Interaction, user: discord.User, amount: int):
+    if interaction.user.id != DEV_ID:
+        embed = discord.Embed(
+            title="❌ ไม่มีสิทธิ์",
+            description="เฉพาะเจ้าของบอทเท่านั้นที่สามารถเพิ่ม points ได้",
+            color=COLOR_ERROR
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    
+    if amount <= 0:
+        embed = discord.Embed(
+            title="❌ จำนวนไม่ถูกต้อง",
+            description="กรุณาระบุจำนวน points มากกว่า 0",
+            color=COLOR_ERROR
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    
+    new_balance = add_user_points(str(user.id), amount)
+    
+    embed = discord.Embed(
+        title="✅ เพิ่ม Points สำเร็จ",
+        description=f"เพิ่ม **{amount}** points ให้ {user.mention}",
+        color=COLOR_SUCCESS
+    )
+    embed.add_field(name="👤 ผู้ใช้", value=f"`{user.name}` ({user.id})", inline=True)
+    embed.add_field(name="💰 เพิ่ม", value=f"`+{amount}` points", inline=True)
+    embed.add_field(name="💳 คงเหลือ", value=f"`{new_balance}` points", inline=True)
+    embed.set_footer(text="🔴 Point System")
+    
+    await interaction.response.send_message(embed=embed)
+    await send_simple_log(bot, f"💰 **ADD POINTS** | {interaction.user.name} added {amount} points to {user.name} (Total: {new_balance})")
+
+# ============================
+# /mypoints COMMAND
+# ============================
+@bot.tree.command(name="mypoints", description="ดู points ของตัวเอง")
+async def mypoints_cmd(interaction: discord.Interaction):
+    user_id = str(interaction.user.id)
+    points = get_user_points(user_id)
+    
+    embed = discord.Embed(
+        title="💳 Points ของคุณ",
+        description=f"คุณมี **{points}** points",
+        color=COLOR_PRIMARY
+    )
+    embed.add_field(name="💰 อัตราแลก", value=f"`{POINTS_PER_DAY}` points = 1 วัน", inline=True)
+    
+    # คำนวณว่าเพิ่มได้กี่วัน
+    days_available = points // POINTS_PER_DAY
+    embed.add_field(name="📅 เพิ่มได้", value=f"`{days_available}` วัน", inline=True)
+    embed.set_footer(text="🔴 Point System")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
+
+# ============================
+# /checkpoints COMMAND (Owner only)
+# ============================
+@bot.tree.command(name="checkpoints", description="ดู points ของผู้ใช้อื่น (Owner เท่านั้น)")
+@app_commands.describe(user="ผู้ใช้ที่ต้องการตรวจสอบ")
+async def checkpoints_cmd(interaction: discord.Interaction, user: discord.User):
+    if interaction.user.id != DEV_ID:
+        embed = discord.Embed(
+            title="❌ ไม่มีสิทธิ์",
+            description="เฉพาะเจ้าของบอทเท่านั้นที่สามารถดู points ของผู้อื่นได้",
+            color=COLOR_ERROR
+        )
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+        return
+    
+    user_id = str(user.id)
+    points = get_user_points(user_id)
+    days_available = points // POINTS_PER_DAY
+    
+    embed = discord.Embed(
+        title="💳 ข้อมูล Points",
+        color=COLOR_PRIMARY
+    )
+    embed.add_field(name="👤 ผู้ใช้", value=f"`{user.name}` ({user.id})", inline=False)
+    embed.add_field(name="💰 Points", value=f"`{points}` points", inline=True)
+    embed.add_field(name="📅 เพิ่มได้", value=f"`{days_available}` วัน", inline=True)
+    embed.set_footer(text="🔴 Point System")
+    
+    await interaction.response.send_message(embed=embed, ephemeral=True)
 
 # ============================
 # RUN BOT
